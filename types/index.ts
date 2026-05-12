@@ -1,6 +1,6 @@
 // Domain types for Kilwa frontend.
-// All shapes here are placeholders pending the contracts.md handoff from the
-// backend pod. Files importing these should not assume field names are stable.
+// Shapes here are placeholders pending the contracts.md handoff from the
+// backend pod. Treat field names and units as draft.
 
 export type Region =
   | "North Africa"
@@ -11,22 +11,28 @@ export type Region =
 
 export type SectorTag =
   | "Energy"
+  | "Renewables"
   | "Agriculture"
   | "Tech"
+  | "Fintech"
   | "Finance"
   | "Mining"
   | "Tourism"
   | "Telecom"
   | "Manufacturing"
-  | "Logistics";
+  | "Logistics"
+  | "Infrastructure"
+  | "Healthcare";
 
 // SWAP: shape will be confirmed in contracts.md once backend pod finalizes
 export interface Country {
-  code: string; // ISO-3166 alpha-2, lowercased for URL slugs
+  code: string; // ISO-3166 alpha-2 lowercase — used in URL slugs
+  iso3: string; // ISO-3166 alpha-3 uppercase — used in UI badges
   name: string;
   region: Region;
   isi_score: number; // 0–100
-  gdp_estimate_usd_b: number; // billions
+  gdp_estimate_usd_b: number;
+  perf_1w: number; // 1-week performance in % (USD)
   sectors: SectorTag[];
 }
 
@@ -70,9 +76,22 @@ export interface TopDriver {
   id: string;
   title: string;
   source: string;
+  source_tier: "t1" | "t2" | "t3";
   url: string;
   snippet: string;
   sentiment_score: number; // -1 to 1
   contribution_weight: number; // 0–1
   published_at: string; // ISO timestamp
+  tags: string[];
+}
+
+// SWAP: shape will be confirmed in contracts.md once backend pod finalizes
+export interface KpiTile {
+  label: string;
+  value: string;
+  unit?: string;
+  sub: string;
+  tone?: "pos" | "neg" | "brand" | "neutral";
+  delta?: { value: string; tone: "pos" | "neg" };
+  foot?: string;
 }
