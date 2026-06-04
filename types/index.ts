@@ -9,68 +9,29 @@ export type Region =
   | "Southern Africa"
   | "Central Africa";
 
-export type SectorTag =
-  | "Energy"
-  | "Renewables"
-  | "Agriculture"
-  | "Tech"
-  | "Fintech"
-  | "Finance"
-  | "Mining"
-  | "Tourism"
-  | "Telecom"
-  | "Manufacturing"
-  | "Logistics"
-  | "Infrastructure"
-  | "Healthcare";
-
-// SWAP: shape will be confirmed in contracts.md once backend pod finalizes
+// A single market in the coverage universe. Drives the Market Map treemap.
+// Figures are sourced live from the IMF World Economic Outlook (DataMapper API)
+// — see app/api/markets/route.ts.
 export interface Country {
-  code: string; // ISO-3166 alpha-2 lowercase — used in URL slugs
-  iso3: string; // ISO-3166 alpha-3 uppercase — used in UI badges
+  code: string; // ISO-3166 alpha-2 lowercase — React key
+  iso3: string; // ISO-3166 alpha-3 uppercase — IMF country code + UI badge
   name: string;
   region: Region;
-  isi_score: number; // 0–100
-  gdp_estimate_usd_b: number;
-  perf_1w: number; // 1-week performance in % (USD)
-  sectors: SectorTag[];
+  gdp_usd_b: number; // NGDPD — GDP, current prices, USD billions (drives tile size)
+  gdp_growth: number; // NGDP_RPCH — real GDP growth, % (drives teal/red colour)
+  isi_score?: number | null; // latest ISI (EWMA, 0–100) from the sentiment ISI tables
+  isi_momentum?: number | null; // latest ISI momentum (rising/falling sentiment)
+  // IMF macro extras shown on hover. null when IMF has no value for the market.
+  inflation?: number | null; // PCPIPCH — avg consumer prices, %
+  gdp_per_capita?: number | null; // NGDPDPC — GDP per capita, current USD
+  population?: number | null; // LP — population, millions
+  govt_debt_pct?: number | null; // GGXWDG_NGDP — govt gross debt, % of GDP
+  unemployment?: number | null; // LUR — unemployment rate, %
+  current_account_pct?: number | null; // BCA_NGDPD — current account, % of GDP
+  data_year?: number; // WEO year the figures are drawn from
 }
 
-// SWAP: shape will be confirmed in contracts.md once backend pod finalizes
-export interface SentimentISIPoint {
-  date: string; // ISO yyyy-mm-dd
-  sentiment_isi: number; // 0–100
-  macro_isi: number; // 0–100
-  volume: number; // article count for the day
-  momentum: number; // -10 to 10
-}
-
-// SWAP: shape will be confirmed in contracts.md once backend pod finalizes
-export interface BriefDriver {
-  text: string;
-  source: string;
-  url: string;
-}
-
-// SWAP: shape will be confirmed in contracts.md once backend pod finalizes
-export type RiskSeverity = "low" | "medium" | "high";
-
-// SWAP: shape will be confirmed in contracts.md once backend pod finalizes
-export interface BriefRisk {
-  text: string;
-  severity: RiskSeverity;
-}
-
-// SWAP: shape will be confirmed in contracts.md once backend pod finalizes
-export interface CountryBrief {
-  country_code: string;
-  title: string;
-  summary: string;
-  key_drivers: BriefDriver[];
-  risks: BriefRisk[];
-  generated_at: string; // ISO timestamp
-}
-
+// A scored news item feeding the Sentiment Pulse news flow.
 // SWAP: shape will be confirmed in contracts.md once backend pod finalizes
 export interface TopDriver {
   id: string;
@@ -83,15 +44,4 @@ export interface TopDriver {
   contribution_weight: number; // 0–1
   published_at: string; // ISO timestamp
   tags: string[];
-}
-
-// SWAP: shape will be confirmed in contracts.md once backend pod finalizes
-export interface KpiTile {
-  label: string;
-  value: string;
-  unit?: string;
-  sub: string;
-  tone?: "pos" | "neg" | "brand" | "neutral";
-  delta?: { value: string; tone: "pos" | "neg" };
-  foot?: string;
 }

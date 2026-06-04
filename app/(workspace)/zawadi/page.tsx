@@ -9,6 +9,7 @@ import {
   KeyboardEvent,
   ReactNode,
 } from "react";
+import { API_BASE, getAuthHeaders } from "@/lib/api";
 
 // Zawadi is the conversational AI workspace, wired to the backend at
 // /api/rag/chat/*. The backend lives at NEXT_PUBLIC_API_URL (default
@@ -24,8 +25,6 @@ import {
 // Auth: JWT pulled from localStorage("access_token") when present. /send works
 // anonymously, so the page is usable without auth — list/history endpoints
 // simply return empty until auth lands.
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5001";
 
 type Source = {
   title?: string;
@@ -55,12 +54,6 @@ const DEFAULT_PROMPTS = [
   "Which African countries are best for investment?",
   "Show me recent market news",
 ];
-
-function getAuthHeaders(): Record<string, string> {
-  if (typeof window === "undefined") return {};
-  const token = window.localStorage.getItem("access_token");
-  return token ? { Authorization: `Bearer ${token}` } : {};
-}
 
 export default function ZawadiPage() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -260,7 +253,7 @@ export default function ZawadiPage() {
     [...messages].reverse().find((m) => m.role === "assistant")?.sources || [];
 
   return (
-    <div className="theme-gold flex min-w-0 flex-1 overflow-hidden bg-bg-0 text-ink-1">
+    <div className="flex min-w-0 flex-1 overflow-hidden bg-bg-0 text-ink-1">
       {/* THREADS panel */}
       <aside className="hidden w-[248px] shrink-0 overflow-y-auto border-r border-rule bg-bg-1 px-3 py-3.5 md:block">
         <button

@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Search, Sparkles, ChevronRight } from "lucide-react";
+import { Sparkles, ChevronRight } from "lucide-react";
 
 // Resolve the breadcrumb trail and current page label from the pathname. Kept
 // here (not as a generic util) because the crumb copy is page-specific.
@@ -13,13 +13,13 @@ function breadcrumb(pathname: string): {
   if (pathname === "/" || pathname.startsWith("/dashboard")) {
     return {
       trail: ["Africa", "All Regions"],
-      here: "Investment Suitability",
+      here: "Market Map",
     };
   }
-  if (pathname.startsWith("/sentiment-isi")) {
+  if (pathname.startsWith("/overview")) {
     return {
-      trail: ["Workspace", "Markets"],
-      here: "Sentiment ISI",
+      trail: ["Africa", "All Regions"],
+      here: "Overview",
     };
   }
   if (pathname.startsWith("/sentiment-pulse")) {
@@ -28,20 +28,8 @@ function breadcrumb(pathname: string): {
       here: "Sentiment Pulse",
     };
   }
-  if (pathname.startsWith("/meti")) {
-    return {
-      trail: ["Workspace", "Models"],
-      here: "Market Entry Timing",
-    };
-  }
   if (pathname.startsWith("/zawadi")) {
     return { trail: ["Workspace", "AI"], here: "Zawadi" };
-  }
-  if (pathname.startsWith("/markets")) {
-    return { trail: ["Workspace"], here: "Markets" };
-  }
-  if (pathname.startsWith("/settings")) {
-    return { trail: ["Account"], here: "Settings" };
   }
   return { trail: ["Workspace"], here: "Overview" };
 }
@@ -76,30 +64,8 @@ export function TopBar() {
         <span className="font-medium text-ink-1">{here}</span>
       </nav>
 
-      {/* Search */}
-      <div className="relative hidden max-w-[420px] flex-1 md:block">
-        <Search
-          size={14}
-          strokeWidth={2}
-          className="pointer-events-none absolute left-[11px] top-1/2 -translate-y-1/2 text-ink-3"
-        />
-        <input
-          type="text"
-          placeholder="Search ISI scores, signals, or insights…"
-          className="w-full rounded-md border border-rule bg-bg-0 py-[7px] pl-8 pr-12 text-[12.5px] text-ink-1 outline-none placeholder:text-ink-3 focus:border-[var(--brand-soft)] focus:shadow-[0_0_0_3px_oklch(0.40_0.08_70/0.18)]"
-        />
-        <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 rounded border border-rule bg-bg-2 px-1.5 py-0.5 mono text-[10px] text-ink-3">
-          ⌘ K
-        </span>
-      </div>
-
       {/* Right cluster */}
       <div className="ml-auto flex items-center gap-2.5">
-        <div className="hidden text-right text-[10.5px] leading-tight text-ink-3 lg:block">
-          <div className="font-medium text-ink-2 mono">14:22:08 UTC</div>
-          <div className="mono">refresh in 00:00:52</div>
-        </div>
-
         <div className="hidden items-center gap-1.5 rounded-full border border-[oklch(0.36_0.08_175)] bg-[oklch(0.32_0.06_175)] px-2.5 py-1 text-[11px] font-medium text-pos md:flex">
           <span className="h-1.5 w-1.5 rounded-full bg-pos shadow-[0_0_6px_var(--pos)] blink" />
           Live

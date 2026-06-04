@@ -1,450 +1,406 @@
-import Link from "next/link";
-import { ChevronRight, Sparkles, Pin, Bell, ExternalLink } from "lucide-react";
-import { topDrivers } from "@/lib/stubs/topDrivers";
-import { countries } from "@/lib/stubs/countries";
+"use client";
 
-// Page-local sparkline — small SVG, no dep on d3 or recharts.
-function MiniSpark({
-  values,
-  tone,
-  height = 28,
-}: {
-  values: number[];
-  tone: "pos" | "neg" | "neutral";
-  height?: number;
-}) {
-  const w = 100;
-  const h = height;
-  const max = Math.max(...values);
-  const min = Math.min(...values);
-  const range = max - min || 1;
-  const d = values
-    .map((v, i) => {
-      const x = (i / (values.length - 1)) * w;
-      const y = h - ((v - min) / range) * (h - 4) - 2;
-      return (i === 0 ? "M" : "L") + x.toFixed(1) + "," + y.toFixed(1);
-    })
-    .join(" ");
-  const color =
-    tone === "pos" ? "var(--pos)" : tone === "neg" ? "var(--neg)" : "var(--ink-3)";
-  return (
-    <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" className="h-full w-full">
-      <path d={d} fill="none" stroke={color} strokeWidth={1.5} strokeLinejoin="round" />
-    </svg>
-  );
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ExternalLink } from "lucide-react";
+
+// Sentiment Pulse — positive/negative news flow per country, plus the ISI trend
+// (wired next). Data comes from our own server route, which queries the
+// BigQuery `news_articles` table (filled by the teammates' scraper) server-side:
+//
+//   GET /api/sentiment/news?country=KE  →  { country, articles: NewsArticle[] }
+//
+// Credentials live only in the server route; the browser never touches BigQuery.
+
+// Countries in scope. `id` is the BigQuery `country_id` value (ISO-2 upper).
+const COUNTRIES = [
+  { id: "KE", label: "Kenya" },
+  { id: "NG", label: "Nigeria" },
+  { id: "RW", label: "Rwanda" },
+];
+
+interface NewsArticle {
+  id: string;
+  title?: string;
+  summary?: string;
+  content?: string;
+  source?: string;
+  url?: string;
+  published_at?: string;
+  sentiment_score?: number;
+  sentiment_label?: string;
+  sentiment_confidence?: number;
+  relevance_score?: number;
+  topics?: string[];
 }
+
+interface IsiPoint {
+  bucket_start: string | null;
+  raw_score_100: number | null;
+  ewma_score_100: number | null;
+  article_count: number | null;
+  volume_z: number | null;
+  momentum: number | null;
+}
+
+interface IsiData {
+  country: string;
+  latest: IsiPoint | null;
+  state: { model_version: string | null; last_ewma: number | null; updated_at: string | null } | null;
+  series: IsiPoint[];
+}
+
+// Rows come from a table a third party can write to, so only trust http(s)
+// links — this stops a tampered `javascript:` URL from ever becoming a live
+// href. (React already escapes the text fields.)
+function safeUrl(u?: string): string | undefined {
+  if (!u) return undefined;
+  try {
+    const parsed = new URL(u);
+    return parsed.protocol === "http:" || parsed.protocol === "https:"
+      ? parsed.href
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+type LoadState = "loading" | "ready" | "empty" | "error";
 
 export default function SentimentPulsePage() {
-  // Top 6 countries for the per-country gauge list.
-  const gaugeCountries = countries.slice(0, 6);
-  const sectors = [
-    { name: "Energy & Renewables", pos: 62, neu: 28, neg: 10, net: 52, spark: [4, 8, 6, 10, 14, 18, 22] },
-    { name: "Technology & Fintech", pos: 71, neu: 22, neg: 7, net: 64, spark: [10, 12, 16, 14, 18, 22, 28] },
-    { name: "Infrastructure", pos: 48, neu: 36, neg: 16, net: 32, spark: [2, 4, 6, 5, 8, 10, 12] },
-    { name: "Mining & Metals", pos: 41, neu: 30, neg: 29, net: 12, spark: [16, 14, 10, 12, 8, 6, 4] },
-    { name: "Agriculture", pos: 54, neu: 31, neg: 15, net: 39, spark: [6, 8, 10, 9, 12, 14, 16] },
-    { name: "Financial Markets", pos: 36, neu: 38, neg: 26, net: 10, spark: [10, 12, 8, 10, 7, 5, 4] },
-  ];
-  const keywords = [
-    { w: "Eurobond", sz: 22, t: "pos" as const },
-    { w: "M-PESA", sz: 18, t: "pos" as const },
-    { w: "Tinubu", sz: 16, t: "neu" as const },
-    { w: "SARB", sz: 19, t: "neg" as const },
-    { w: "green hydrogen", sz: 17, t: "pos" as const },
-    { w: "FX shortage", sz: 15, t: "neg" as const },
-    { w: "AfCFTA", sz: 14, t: "pos" as const },
-    { w: "drought", sz: 13, t: "neg" as const },
-    { w: "IPO pipeline", sz: 16, t: "pos" as const },
-    { w: "default risk", sz: 14, t: "neg" as const },
-    { w: "fintech licensing", sz: 15, t: "pos" as const },
-    { w: "coalition", sz: 14, t: "neg" as const },
-  ];
-  const alerts = [
-    { state: "met", label: "NSI > 60 sustained 24h", value: "fired 02:14 UTC" },
-    { state: "armed", label: "ZAF NSI < 30", value: "armed · 14d" },
-    { state: "armed", label: "Negative-news spike +2σ", value: "armed" },
-    { state: "idle", label: "EUR/USD vol > 1σ", value: "idle" },
-  ];
+  const [country, setCountry] = useState("KE");
+  const [articles, setArticles] = useState<NewsArticle[]>([]);
+  const [state, setState] = useState<LoadState>("loading");
+  const [isi, setIsi] = useState<IsiData | null>(null);
+  const [isiState, setIsiState] = useState<LoadState>("loading");
+
+  const load = useCallback(async (c: string) => {
+    setState("loading");
+    try {
+      const res = await fetch(
+        `/api/sentiment/news?country=${encodeURIComponent(c)}`,
+      );
+      if (!res.ok) {
+        setState("error");
+        return;
+      }
+      const json = await res.json();
+      const list: NewsArticle[] = Array.isArray(json?.articles)
+        ? json.articles
+        : Array.isArray(json)
+          ? json
+          : [];
+      setArticles(list);
+      setState(list.length > 0 ? "ready" : "empty");
+    } catch {
+      setState("error");
+    }
+  }, []);
+
+  const loadIsi = useCallback(async (c: string) => {
+    setIsiState("loading");
+    try {
+      const res = await fetch(`/api/sentiment/isi?country=${encodeURIComponent(c)}`);
+      if (!res.ok) {
+        setIsiState("error");
+        return;
+      }
+      const json: IsiData = await res.json();
+      const series = Array.isArray(json?.series) ? json.series : [];
+      setIsi(json);
+      setIsiState(series.length > 0 ? "ready" : "empty");
+    } catch {
+      setIsiState("error");
+    }
+  }, []);
+
+  useEffect(() => {
+    void load(country);
+    void loadIsi(country);
+  }, [country, load, loadIsi]);
+
+  const positive = articles.filter(
+    (a) => (a.sentiment_label ?? "").toLowerCase() === "positive",
+  );
+  const negative = articles.filter(
+    (a) => (a.sentiment_label ?? "").toLowerCase() === "negative",
+  );
+  const activeLabel = COUNTRIES.find((c) => c.id === country)?.label ?? country;
 
   return (
-    <>
-      {/* No FiltersPanel here — Sentiment Pulse has its own filter bar at top */}
-      <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        {/* Filter bar */}
-        <div className="flex h-[46px] shrink-0 items-center gap-3 overflow-x-auto border-b border-rule bg-bg-1 px-[22px]">
-          <span className="text-[10px] uppercase tracking-[0.6px] text-ink-3">Scenario</span>
-          <Pill on>Base</Pill>
-          <Pill>Stress</Pill>
-          <span className="ml-2 text-[10px] uppercase tracking-[0.6px] text-ink-3">Countries</span>
-          {["KEN", "NGA", "ZAF", "EGY", "MAR", "GHA"].map((c) => (
-            <Pill key={c} dot>{c}</Pill>
-          ))}
-          <span className="ml-2 text-[10px] uppercase tracking-[0.6px] text-ink-3">Range</span>
-          {["1W", "1M", "3M", "6M"].map((r, i) => (
-            <Pill key={r} on={i === 1}>{r}</Pill>
-          ))}
-          <span className="ml-2 text-[10px] uppercase tracking-[0.6px] text-ink-3">Source</span>
-          {["All", "Tier-1", "Local", "Regulator", "Social"].map((s, i) => (
-            <Pill key={s} on={i === 0}>{s}</Pill>
-          ))}
+    <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      {/* Country selector */}
+      <div className="flex h-[46px] shrink-0 items-center gap-3 overflow-x-auto border-b border-rule bg-bg-1 px-[22px]">
+        <span className="text-[10px] uppercase tracking-[0.6px] text-ink-3">Country</span>
+        {COUNTRIES.map((c) => (
+          <button
+            key={c.id}
+            type="button"
+            onClick={() => setCountry(c.id)}
+            className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] ${
+              country === c.id
+                ? "border-brand bg-[var(--brand-soft)] text-ink-1"
+                : "border-rule bg-bg-2 text-ink-2 hover:text-ink-1"
+            }`}
+          >
+            {c.label}
+          </button>
+        ))}
+        <span className="ml-auto mono text-[10px] text-ink-3">
+          Source: BigQuery · news_articles
+        </span>
+      </div>
+
+      {/* Body */}
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto bg-bg-0 p-4">
+        {/* ISI trend & score */}
+        <IsiSection status={isiState} data={isi} country={activeLabel} />
+
+        {/* News flow: positive / negative columns */}
+        {state !== "ready" ? (
+          <Message state={state} />
+        ) : (
+          <div className="grid grid-cols-2 gap-3">
+            <NewsFlow tone="pos" title="Positive flow" items={positive} />
+            <NewsFlow tone="neg" title="Negative flow" items={negative} />
+          </div>
+        )}
+      </div>
+    </main>
+  );
+}
+
+function Message({ state }: { state: LoadState }) {
+  const text =
+    state === "loading"
+      ? "Loading news…"
+      : state === "error"
+        ? "Couldn't load news. Check that BigQuery credentials are set (GOOGLE_APPLICATION_CREDENTIALS in .env.local)."
+        : "No articles for this country yet.";
+  return (
+    <div className="flex h-40 items-center justify-center rounded-lg border border-rule bg-bg-1 px-6 text-center text-[12px] text-ink-3">
+      {text}
+    </div>
+  );
+}
+
+function IsiSection({
+  status,
+  data,
+  country,
+}: {
+  status: LoadState;
+  data: IsiData | null;
+  country: string;
+}) {
+  if (status !== "ready" || !data || data.series.length === 0) {
+    const text =
+      status === "loading"
+        ? "Loading ISI…"
+        : status === "error"
+          ? "Couldn't load ISI data."
+          : "No ISI data for this country yet.";
+    return (
+      <section className="flex h-[180px] items-center justify-center rounded-lg border border-rule bg-bg-1 text-[12px] text-ink-3">
+        {text}
+      </section>
+    );
+  }
+
+  const latest = data.latest;
+  const score = latest?.ewma_score_100 ?? data.state?.last_ewma ?? null;
+  const momentum = latest?.momentum ?? null;
+  const raw = latest?.raw_score_100 ?? null;
+  const updated = data.state?.updated_at ?? latest?.bucket_start ?? null;
+  const tone =
+    score == null ? "text-ink-1" : score >= 66 ? "text-pos" : score >= 40 ? "text-ink-1" : "text-neg";
+
+  return (
+    <section className="rounded-lg border border-rule bg-bg-1 p-4">
+      <div className="mb-3 flex items-baseline justify-between">
+        <div>
+          <span className="text-[10px] uppercase tracking-[0.6px] text-ink-3">
+            Investment Sentiment Index · {country}
+          </span>
+          <div className="text-[12px] text-ink-2">
+            EWMA-smoothed · 0–100 · {data.series.length} buckets
+          </div>
         </div>
-
-        {/* 3-column body */}
-        <div className="grid min-h-0 flex-1 grid-cols-[288px_1fr_304px] overflow-hidden">
-          {/* LEFT */}
-          <aside className="overflow-y-auto border-r border-rule bg-bg-1 p-4">
-            {/* NSI Card */}
-            <Card>
-              <div className="mb-1 flex items-baseline justify-between">
-                <span className="text-[10px] uppercase tracking-[0.6px] text-ink-3">Net Sentiment Index</span>
-                <span className="rounded-full border border-[oklch(0.36_0.08_175)] bg-[oklch(0.32_0.06_175)] px-2 py-0.5 mono text-[10px] text-pos">
-                  ▲ +4.2
-                </span>
-              </div>
-              <div className="mono mt-1 text-[42px] font-medium leading-none tracking-[-1px] text-ink-1">
-                +18.4<span className="ml-1 text-[14px] text-ink-3">/100</span>
-              </div>
-              <div className="mt-1 text-[10.5px] text-ink-3">
-                Formula: weighted (pos − neg) × tier × decay · 28-day rolling
-              </div>
-              <div className="my-3 h-8">
-                <MiniSpark
-                  values={[14, 16, 18, 17, 19, 22, 20, 18, 21, 24, 26, 22, 23, 18]}
-                  tone="pos"
-                  height={32}
-                />
-              </div>
-              <div className="grid grid-cols-3 gap-2 border-t border-dashed border-rule pt-2.5 mono text-[10px]">
-                <Kv k="vol" v="2.1σ" />
-                <Kv k="ŝ" v="0.74" />
-                <Kv k="n" v="11,427" />
-              </div>
-            </Card>
-
-            {/* Mini KPIs */}
-            <div className="mt-3 grid grid-cols-2 gap-2">
-              <MiniKpi label="Positive share" value="62.4%" delta="+1.8" tone="pos" />
-              <MiniKpi label="Negative alerts" value="14" delta="+3" tone="neg" />
-              <MiniKpi label="Source diversity" value="0.71" sub="11 active" />
-              <MiniKpi label="Median latency" value="4.2m" sub="P50" />
+        {data.state?.model_version ? (
+          <span className="mono text-[10px] text-ink-3">{data.state.model_version}</span>
+        ) : null}
+      </div>
+      <div className="flex gap-6">
+        {/* Headline numbers */}
+        <div className="w-[180px] shrink-0">
+          <div className="text-[10px] uppercase tracking-[0.6px] text-ink-3">ISI score</div>
+          <div className={`mono text-[46px] font-medium leading-none tracking-[-1px] ${tone}`}>
+            {score == null ? "—" : score.toFixed(1)}
+            <span className="ml-1 text-[14px] text-ink-3">/100</span>
+          </div>
+          <dl className="mt-4 space-y-2 text-[11.5px]">
+            <KvRow k="Momentum" v={momentum == null ? "—" : `${momentum >= 0 ? "+" : ""}${momentum.toFixed(2)}`} tone={momentum == null ? "" : momentum >= 0 ? "text-pos" : "text-neg"} />
+            <KvRow k="Raw" v={raw == null ? "—" : raw.toFixed(0)} />
+            <KvRow
+              k="Updated"
+              v={updated ? new Date(updated).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "—"}
+            />
+          </dl>
+          <div className="mt-3.5 space-y-2 border-t border-dashed border-rule pt-3 text-[10.5px]">
+            <div className="flex items-center gap-2">
+              <span className="inline-block h-[2px] w-4 shrink-0 rounded-full bg-brand" />
+              <span className="font-semibold text-ink-1">EWMA</span>
+              <span className="text-ink-3">smoothed</span>
             </div>
-
-            {/* Source mix */}
-            <SectionHead>Source mix · 28d</SectionHead>
-            <Card>
-              <div className="flex h-2 overflow-hidden rounded-sm">
-                <span className="block bg-brand" style={{ width: "32%" }} />
-                <span className="block bg-pos" style={{ width: "22%" }} />
-                <span className="block bg-[var(--accent)]" style={{ width: "18%" }} />
-                <span className="block bg-ink-3" style={{ width: "16%" }} />
-                <span className="block bg-neg" style={{ width: "12%" }} />
-              </div>
-              <ul className="mt-3 space-y-1.5 text-[11px]">
-                {[
-                  ["Tier-1 newswire", 32, "var(--brand)"],
-                  ["Regulator / CB", 22, "var(--pos)"],
-                  ["Local press", 18, "var(--accent)"],
-                  ["Research / model", 16, "var(--ink-3)"],
-                  ["Social / unranked", 12, "var(--neg)"],
-                ].map(([n, p, c]) => (
-                  <li key={n as string} className="flex items-center gap-2 text-ink-2">
-                    <span className="h-2 w-2 rounded-sm" style={{ background: c as string }} />
-                    <span className="flex-1">{n}</span>
-                    <span className="mono text-ink-3">{p}%</span>
-                  </li>
-                ))}
-              </ul>
-            </Card>
-
-            {/* Country gauges */}
-            <SectionHead>By country · ISI linked</SectionHead>
-            <div className="space-y-1.5">
-              {gaugeCountries.map((c) => {
-                const pos = 40 + Math.round(c.isi_score / 3);
-                const neg = 100 - pos - 25;
-                const tone = c.perf_1w >= 0 ? "pos" : "neg";
-                return (
-                  <Link
-                    key={c.code}
-                    href={`/sentiment-isi/${c.iso3.toLowerCase()}`}
-                    className="block rounded-md border border-rule bg-bg-2 p-2.5 hover:border-rule-2"
-                  >
-                    <div className="mb-1.5 flex items-center justify-between text-[11.5px]">
-                      <span className="font-medium text-ink-1">{c.name}</span>
-                      <span className="flex items-center gap-1.5">
-                        <span className={`mono text-[10.5px] ${tone === "pos" ? "text-pos" : "text-neg"}`}>
-                          {c.perf_1w >= 0 ? "+" : ""}
-                          {c.perf_1w.toFixed(2)}
-                        </span>
-                        <ChevronRight size={11} className="text-ink-3" />
-                      </span>
-                    </div>
-                    <div className="flex h-1.5 overflow-hidden rounded-sm">
-                      <span className="block bg-pos" style={{ width: `${pos}%` }} />
-                      <span className="block bg-ink-3" style={{ width: `${25}%` }} />
-                      <span className="block bg-neg" style={{ width: `${neg}%` }} />
-                    </div>
-                    <div className="mono mt-1 flex justify-between text-[9.5px] text-ink-3">
-                      <span>{pos}% pos</span>
-                      <span>{neg}% neg</span>
-                    </div>
-                  </Link>
-                );
-              })}
-            </div>
-          </aside>
-
-          {/* CENTER */}
-          <div className="overflow-y-auto bg-bg-0">
-            <Card className="m-4">
-              <div className="mb-3 flex items-baseline justify-between">
-                <div>
-                  <span className="text-[10px] uppercase tracking-[0.6px] text-ink-3">Net sentiment trend</span>
-                  <div className="text-[12px] text-ink-2">Multi-country · 28-day rolling · 80% confidence band</div>
-                </div>
-                <div className="flex gap-3 text-[11px] text-ink-3">
-                  <label className="flex items-center gap-1.5">
-                    <input type="checkbox" defaultChecked className="accent-[var(--brand)]" /> Confidence
-                  </label>
-                  <label className="flex items-center gap-1.5">
-                    <input type="checkbox" defaultChecked className="accent-[var(--brand)]" /> Events
-                  </label>
-                  <label className="flex items-center gap-1.5">
-                    <input type="checkbox" defaultChecked className="accent-[var(--brand)]" /> Volume
-                  </label>
-                </div>
-              </div>
-              {/* Simplified multi-line chart */}
-              <TrendChart />
-            </Card>
-
-            {/* News flow grid */}
-            <div className="grid grid-cols-2 gap-3 px-4 pb-4">
-              <NewsFlow tone="pos" title="Positive flow" items={topDrivers.filter((d) => d.sentiment_score > 0)} />
-              <NewsFlow tone="neg" title="Negative flow" items={topDrivers.filter((d) => d.sentiment_score <= 0)} />
+            <div className="flex items-center gap-2">
+              <span className="inline-block w-4 shrink-0 border-t border-dashed border-ink-3" />
+              <span className="font-semibold text-ink-1">Raw</span>
+              <span className="text-ink-3">per bucket</span>
             </div>
           </div>
-
-          {/* RIGHT */}
-          <aside className="overflow-y-auto border-l border-rule bg-bg-1 p-4">
-            <SectionHead className="mt-0">Sector sentiment</SectionHead>
-            <ul className="space-y-2">
-              {sectors.map((s) => (
-                <li key={s.name} className="rounded-md border border-rule bg-bg-2 px-2.5 py-2">
-                  <div className="mb-1 flex items-baseline justify-between text-[11.5px]">
-                    <span className="text-ink-1">{s.name}</span>
-                    <span className={`mono text-[10.5px] ${s.net >= 0 ? "text-pos" : "text-neg"}`}>
-                      {s.net >= 0 ? "+" : ""}{s.net}
-                    </span>
-                  </div>
-                  <div className="flex h-1.5 overflow-hidden rounded-sm">
-                    <span className="block bg-pos" style={{ width: `${s.pos}%` }} />
-                    <span className="block bg-ink-3" style={{ width: `${s.neu}%` }} />
-                    <span className="block bg-neg" style={{ width: `${s.neg}%` }} />
-                  </div>
-                  <div className="mt-1 h-5">
-                    <MiniSpark values={s.spark} tone={s.net >= 0 ? "pos" : "neg"} height={20} />
-                  </div>
-                </li>
-              ))}
-            </ul>
-
-            <SectionHead>Keyword cloud</SectionHead>
-            <div className="flex flex-wrap gap-1.5">
-              {keywords.map((k) => {
-                const toneClass =
-                  k.t === "pos"
-                    ? "border-[oklch(0.36_0.08_175)] bg-[oklch(0.32_0.06_175)] text-pos"
-                    : k.t === "neg"
-                      ? "border-[oklch(0.40_0.10_30)] bg-[oklch(0.30_0.08_30)] text-neg"
-                      : "border-rule bg-bg-2 text-ink-2";
-                return (
-                  <span
-                    key={k.w}
-                    className={`mono inline-block rounded-md border px-2 py-0.5 ${toneClass}`}
-                    style={{ fontSize: `${k.sz * 0.55}px` }}
-                  >
-                    {k.w}
-                  </span>
-                );
-              })}
-            </div>
-
-            <SectionHead>Zawadi take</SectionHead>
-            <Card accent>
-              <div className="mb-1 flex items-center gap-1.5 text-[10.5px] font-semibold uppercase tracking-[0.6px] text-[var(--accent)]">
-                <Sparkles size={11} />
-                Drafted by Zawadi · conf 0.83
-              </div>
-              <p className="text-[12.5px] leading-[1.55] text-ink-1">
-                Net sentiment is being lifted by{" "}
-                <Cite>S1</Cite> fintech licensing in NGA/KEN/GHA and{" "}
-                <Cite>S2</Cite> renewables capex in EGY/MAR. The drag is concentrated in ZAF coalition risk; if{" "}
-                <Cite>S3</Cite> the 15 May SARB read tilts hawkish, expect a 1.5–2σ widening in JSE rand-hedge names.
-              </p>
-              <div className="mt-2.5 rounded-md border border-dashed border-rule-2 p-2 text-[11px] text-ink-3">
-                <span className="font-medium text-ink-2">Steel-man · opposite case:</span>{" "}
-                A SARB hold + soft US CPI print would flip the signal pos by week-end; we&apos;d need a coalition compromise on the budget for that
-                pathway to be base case.
-              </div>
-              <div className="mt-2.5 flex gap-2">
-                <button className="rounded-md border border-rule-2 bg-bg-1 px-2 py-1 text-[10.5px] text-ink-1">
-                  Draft memo
-                </button>
-                <button className="rounded-md border border-rule-2 bg-bg-1 px-2 py-1 text-[10.5px] text-ink-1">
-                  Open thread
-                </button>
-              </div>
-            </Card>
-
-            <SectionHead>Alerts &amp; triggers</SectionHead>
-            <ul className="space-y-1.5">
-              {alerts.map((a) => {
-                const stateColor =
-                  a.state === "met"
-                    ? "var(--pos)"
-                    : a.state === "armed"
-                      ? "var(--brand)"
-                      : "var(--ink-3)";
-                return (
-                  <li
-                    key={a.label}
-                    className="flex items-center gap-2 rounded-md border border-rule bg-bg-2 px-2.5 py-1.5 text-[11px]"
-                  >
-                    <span className="h-1.5 w-1.5 rounded-full" style={{ background: stateColor }} />
-                    <span className="flex-1 text-ink-2">{a.label}</span>
-                    <span className="mono text-[10px] text-ink-3">{a.value}</span>
-                  </li>
-                );
-              })}
-              <li>
-                <button className="w-full rounded-md border border-dashed border-rule-2 px-2.5 py-1.5 text-[11px] text-ink-3 hover:border-brand hover:text-brand">
-                  ＋ New trigger
-                </button>
-              </li>
-            </ul>
-
-            <SectionHead>Sentiment ↔ KEN 10Y spread</SectionHead>
-            <Card>
-              <div className="h-12">
-                <DualSpark />
-              </div>
-              <div className="mt-2 flex justify-between mono text-[10px] text-ink-3">
-                <span>ρ = −0.74</span>
-                <span>lead 3.2d</span>
-                <span className="text-[var(--accent)]">overlay →</span>
-              </div>
-            </Card>
-          </aside>
         </div>
-      </main>
-    </>
-  );
-}
-
-// Local primitives below — kept inline because they're not reusable across the
-// app yet. If sentiment-pulse-style cards spread to other pages we'll lift.
-
-function Card({
-  children,
-  className = "",
-  accent,
-}: {
-  children: React.ReactNode;
-  className?: string;
-  accent?: boolean;
-}) {
-  return (
-    <div
-      className={`rounded-lg border bg-bg-2 px-3 py-3 ${
-        accent ? "border-[var(--accent)]/40 bg-[oklch(0.26_0.05_270)]" : "border-rule"
-      } ${className}`}
-    >
-      {children}
-    </div>
-  );
-}
-
-function SectionHead({
-  children,
-  className = "",
-}: {
-  children: React.ReactNode;
-  className?: string;
-}) {
-  return (
-    <div
-      className={`mb-2 mt-4 text-[10px] font-semibold uppercase tracking-[0.6px] text-ink-3 ${className}`}
-    >
-      {children}
-    </div>
-  );
-}
-
-function MiniKpi({
-  label,
-  value,
-  delta,
-  sub,
-  tone,
-}: {
-  label: string;
-  value: string;
-  delta?: string;
-  sub?: string;
-  tone?: "pos" | "neg";
-}) {
-  const toneClass = tone === "pos" ? "text-pos" : tone === "neg" ? "text-neg" : "text-ink-1";
-  return (
-    <div className="rounded-md border border-rule bg-bg-2 px-2.5 py-2">
-      <div className="text-[10px] text-ink-3">{label}</div>
-      <div className={`mono mt-1 text-[18px] font-medium ${toneClass}`}>{value}</div>
-      <div className="text-[10px] text-ink-3">
-        {delta ? <span className={`mono ${toneClass}`}>{delta}</span> : sub}
+        {/* Trend chart */}
+        <div className="min-w-0 flex-1">
+          <IsiChart series={data.series} />
+        </div>
       </div>
+    </section>
+  );
+}
+
+function KvRow({ k, v, tone = "" }: { k: string; v: string; tone?: string }) {
+  return (
+    <div className="flex items-baseline justify-between gap-3">
+      <dt className="font-semibold text-ink-1">{k}</dt>
+      <dd className={`mono ${tone || "text-ink-1"}`}>{v}</dd>
     </div>
   );
 }
 
-function Kv({ k, v }: { k: string; v: string }) {
-  return (
-    <div>
-      <div className="text-ink-3">{k}</div>
-      <div className="text-ink-1">{v}</div>
-    </div>
-  );
-}
+function IsiChart({ series }: { series: IsiPoint[] }) {
+  const w = 720;
+  const h = 180;
+  const pad = { l: 24, r: 10, t: 12, b: 18 };
+  const n = series.length;
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [hover, setHover] = useState<number | null>(null);
 
-function Pill({
-  children,
-  on,
-  dot,
-}: {
-  children: React.ReactNode;
-  on?: boolean;
-  dot?: boolean;
-}) {
+  const x = (i: number) => pad.l + (n <= 1 ? 0 : (i / (n - 1)) * (w - pad.l - pad.r));
+  const y = (v: number) => pad.t + (1 - v / 100) * (h - pad.t - pad.b);
+
+  const line = (key: "ewma_score_100" | "raw_score_100") =>
+    series
+      .map((p, i) => ({ i, v: p[key] }))
+      .filter((p) => p.v != null)
+      .map((p, idx) => (idx === 0 ? "M" : "L") + x(p.i).toFixed(1) + "," + y(p.v as number).toFixed(1))
+      .join(" ");
+
+  const ewmaPath = line("ewma_score_100");
+  const rawPath = line("raw_score_100");
+  const lastIdx = [...series].map((p, i) => ({ p, i })).reverse().find((o) => o.p.ewma_score_100 != null);
+  const fmt = (t: string | null | undefined) =>
+    t ? new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : "";
+
+  // Map mouse position to the nearest bucket. The SVG is stretched
+  // (preserveAspectRatio none), so we work in element-relative fractions and
+  // back out the data region (inside the left/right padding).
+  function onMove(e: React.MouseEvent) {
+    const el = wrapRef.current;
+    if (!el || n === 0) return;
+    const rect = el.getBoundingClientRect();
+    const frac = (e.clientX - rect.left) / rect.width;
+    const dataLeft = pad.l / w;
+    const dataRight = (w - pad.r) / w;
+    const t = (frac - dataLeft) / (dataRight - dataLeft);
+    const idx = Math.round(Math.min(1, Math.max(0, t)) * (n - 1));
+    setHover(idx);
+  }
+
+  const hp = hover != null ? series[hover] : null;
+  const hx = hover != null ? x(hover) : 0;
+  const leftPct = Math.min(96, Math.max(4, (hx / w) * 100));
+
   return (
-    <button
-      type="button"
-      className={`mono inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10.5px] ${
-        on
-          ? "border-brand bg-[var(--brand-soft)] text-ink-1"
-          : "border-rule bg-bg-2 text-ink-2 hover:text-ink-1"
-      }`}
+    <div
+      ref={wrapRef}
+      className="relative"
+      onMouseMove={onMove}
+      onMouseLeave={() => setHover(null)}
     >
-      {dot ? <span className="h-1.5 w-1.5 rounded-full bg-brand" /> : null}
-      {children}
-    </button>
+      <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" className="block h-[180px] w-full">
+        {[0, 25, 50, 75, 100].map((v) => (
+          <g key={v}>
+            <line x1={pad.l} x2={w - pad.r} y1={y(v)} y2={y(v)} stroke="var(--rule)" strokeDasharray="2 3" />
+            <text x={2} y={y(v) + 3} fill="var(--ink-3)" fontSize={9}>
+              {v}
+            </text>
+          </g>
+        ))}
+        {rawPath ? (
+          <path d={rawPath} fill="none" stroke="var(--ink-3)" strokeWidth={1} strokeDasharray="3 2" opacity={0.45} />
+        ) : null}
+        {ewmaPath ? <path d={ewmaPath} fill="none" stroke="var(--brand)" strokeWidth={1.8} /> : null}
+
+        {/* Hover crosshair + point */}
+        {hp ? (
+          <line x1={hx} x2={hx} y1={pad.t} y2={h - pad.b} stroke="var(--brand)" strokeWidth={1} opacity={0.55} />
+        ) : null}
+        {hp && hp.ewma_score_100 != null ? (
+          <circle cx={hx} cy={y(hp.ewma_score_100)} r={3.5} fill="var(--brand)" stroke="var(--bg-1)" strokeWidth={1} />
+        ) : !hp && lastIdx ? (
+          <circle cx={x(lastIdx.i)} cy={y(lastIdx.p.ewma_score_100 as number)} r={3} fill="var(--brand)" />
+        ) : null}
+
+        <text x={pad.l} y={h - 4} fill="var(--ink-3)" fontSize={9}>
+          {fmt(series[0]?.bucket_start)}
+        </text>
+        <text x={w - pad.r} y={h - 4} fill="var(--ink-3)" fontSize={9} textAnchor="end">
+          {fmt(series[series.length - 1]?.bucket_start)}
+        </text>
+      </svg>
+
+      {/* Hover readout */}
+      {hp ? (
+        <div
+          className="pointer-events-none absolute top-0 -translate-x-1/2 whitespace-nowrap rounded-md border border-rule-2 bg-bg-2 px-2 py-1 text-[10px] shadow-[0_6px_18px_rgba(0,0,0,0.4)]"
+          style={{ left: `${leftPct}%` }}
+        >
+          <div className="mono font-bold text-ink-1">
+            score: {hp.ewma_score_100 != null ? hp.ewma_score_100.toFixed(1) : "—"}
+          </div>
+          {hp.raw_score_100 != null ? (
+            <div className="mono font-bold text-ink-1">
+              raw: {hp.raw_score_100.toFixed(0)}
+            </div>
+          ) : null}
+          <div className="font-bold text-ink-1">
+            {hp.bucket_start
+              ? new Date(hp.bucket_start).toLocaleDateString(undefined, {
+                  year: "numeric",
+                  month: "short",
+                  day: "numeric",
+                })
+              : "—"}
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
-function Cite({ children }: { children: React.ReactNode }) {
-  return (
-    <span className="mono mx-px inline-block cursor-pointer rounded-sm border border-[var(--accent)]/40 bg-[var(--accent)]/20 px-1 py-px text-[9.5px] text-[var(--accent)]">
-      {children}
-    </span>
-  );
+function tierFor(a: NewsArticle): "t1" | "t2" | "t3" {
+  const r = a.relevance_score ?? a.sentiment_confidence ?? 0;
+  return r >= 0.66 ? "t1" : r >= 0.33 ? "t2" : "t3";
+}
+
+// First one or two sentences of the article body, so cards stay short.
+function firstSentences(text: string, max = 2): string {
+  const trimmed = (text ?? "").trim();
+  if (!trimmed) return "";
+  const sentences = trimmed.match(/[^.!?]+[.!?]+/g);
+  if (!sentences) {
+    return trimmed.length > 240 ? trimmed.slice(0, 237).trimEnd() + "…" : trimmed;
+  }
+  return sentences.slice(0, max).join(" ").trim();
 }
 
 function NewsFlow({
@@ -454,9 +410,12 @@ function NewsFlow({
 }: {
   tone: "pos" | "neg";
   title: string;
-  items: typeof topDrivers;
+  items: NewsArticle[];
 }) {
-  const ribbon = tone === "pos" ? "border-pos/40 bg-[oklch(0.32_0.06_175)]/30" : "border-neg/40 bg-[oklch(0.30_0.08_30)]/40";
+  const ribbon =
+    tone === "pos"
+      ? "border-pos/40 bg-[oklch(0.32_0.06_175)]/30"
+      : "border-neg/40 bg-[oklch(0.30_0.08_30)]/40";
   return (
     <div className="rounded-md border border-rule bg-bg-1">
       <div className={`flex items-center gap-2 border-b border-rule px-3 py-2 ${ribbon}`}>
@@ -466,25 +425,67 @@ function NewsFlow({
       </div>
       <ul className="divide-y divide-rule">
         {items.length > 0 ? (
-          items.map((d) => (
-            <li key={d.id} className="px-3 py-2.5 text-[12px] hover:bg-bg-2">
-              <div className="flex items-baseline gap-2">
-                <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: tone === "pos" ? "var(--pos)" : "var(--neg)" }} />
-                <span className="flex-1 text-ink-1">{d.title}</span>
-                <ExternalLink size={11} className="text-ink-3" />
-              </div>
-              <div className="mt-1 flex flex-wrap items-center gap-2 pl-3.5 text-[10.5px] text-ink-3">
-                <span className={`mono rounded border px-1.5 py-px text-[9.5px] ${d.source_tier === "t1" ? "border-[var(--accent)] text-[var(--accent)]" : "border-rule text-ink-3"}`}>
-                  {d.source_tier.toUpperCase()}
-                </span>
-                <span>{d.source}</span>
-                <span>·</span>
-                <span className="mono">{new Date(d.published_at).toLocaleString(undefined, { dateStyle: "short" })}</span>
-                <span className="mono ml-auto">conf {d.contribution_weight.toFixed(2)}</span>
-              </div>
-              <p className="mt-1.5 pl-3.5 text-[11px] leading-snug text-ink-2">{d.snippet}</p>
-            </li>
-          ))
+          items.map((a) => {
+            const href = safeUrl(a.url);
+            const tier = tierFor(a);
+            const snippet = firstSentences(a.summary || a.content || "");
+            const score = a.sentiment_score;
+            return (
+              <li key={a.id} className="px-3 py-2.5 text-[12px] hover:bg-bg-2">
+                <div className="flex items-baseline gap-2">
+                  <span
+                    className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full"
+                    style={{ background: tone === "pos" ? "var(--pos)" : "var(--neg)" }}
+                  />
+                  {href ? (
+                    <a
+                      href={href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex-1 text-ink-1 hover:text-brand"
+                    >
+                      {a.title || "Untitled"}
+                    </a>
+                  ) : (
+                    <span className="flex-1 text-ink-1">{a.title || "Untitled"}</span>
+                  )}
+                  {href ? <ExternalLink size={11} className="text-ink-3" /> : null}
+                </div>
+                <div className="mt-1 flex flex-wrap items-center gap-2 pl-3.5 text-[10.5px] text-ink-3">
+                  <span
+                    className={`mono rounded border px-1.5 py-px text-[9.5px] ${
+                      tier === "t1" ? "border-[var(--accent)] text-[var(--accent)]" : "border-rule text-ink-3"
+                    }`}
+                  >
+                    {tier.toUpperCase()}
+                  </span>
+                  {a.source ? <span>{a.source}</span> : null}
+                  {a.published_at ? (
+                    <>
+                      <span>·</span>
+                      <span className="mono">
+                        {new Date(a.published_at).toLocaleString(undefined, { dateStyle: "short" })}
+                      </span>
+                    </>
+                  ) : null}
+                  <span className="ml-auto flex items-center gap-2 mono">
+                    {typeof a.sentiment_confidence === "number" ? (
+                      <span className="text-ink-3">conf {a.sentiment_confidence.toFixed(2)}</span>
+                    ) : null}
+                    {typeof score === "number" ? (
+                      <span className={score >= 0 ? "text-pos" : "text-neg"}>
+                        {score >= 0 ? "+" : ""}
+                        {score.toFixed(2)}
+                      </span>
+                    ) : null}
+                  </span>
+                </div>
+                {snippet ? (
+                  <p className="mt-1.5 pl-3.5 text-[11px] leading-snug text-ink-2">{snippet}</p>
+                ) : null}
+              </li>
+            );
+          })
         ) : (
           <li className="px-3 py-6 text-center text-[11px] text-ink-3">No items in window.</li>
         )}
@@ -492,109 +493,3 @@ function NewsFlow({
     </div>
   );
 }
-
-function TrendChart() {
-  // Three illustrative country series + confidence band + volume bars.
-  const w = 720;
-  const h = 220;
-  const series = [
-    { label: "KEN", color: "var(--brand)", data: [10, 14, 12, 18, 22, 26, 28, 32, 30, 34, 38, 42, 40, 44] },
-    { label: "NGA", color: "var(--pos)", data: [8, 10, 14, 16, 20, 22, 24, 22, 26, 28, 30, 32, 34, 36] },
-    { label: "ZAF", color: "var(--neg)", data: [16, 12, 10, 8, 6, 4, 2, -2, -6, -10, -14, -18, -20, -22] },
-  ];
-
-  const xs = (i: number) => (i / 13) * (w - 24) + 12;
-  const ys = (v: number) => h - 30 - ((v + 25) / 70) * (h - 50);
-
-  return (
-    <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" className="h-[220px] w-full">
-      {/* horizontal grid */}
-      {[0, 1, 2, 3, 4].map((g) => (
-        <line
-          key={g}
-          x1={12}
-          x2={w - 12}
-          y1={20 + (g * (h - 50)) / 4}
-          y2={20 + (g * (h - 50)) / 4}
-          stroke="var(--rule)"
-          strokeDasharray="2 3"
-        />
-      ))}
-      {/* confidence band on series 0 */}
-      <polygon
-        fill="var(--brand)"
-        fillOpacity={0.1}
-        points={series[0].data
-          .map((v, i) => `${xs(i)},${ys(v + 6)}`)
-          .concat(series[0].data.slice().reverse().map((v, i) => `${xs(13 - i)},${ys(v - 6)}`))
-          .join(" ")}
-      />
-      {/* event markers */}
-      {[2, 6, 11].map((i) => (
-        <circle key={i} cx={xs(i)} cy={ys(series[0].data[i])} r={3.2} fill="var(--ink-1)" stroke="var(--brand)" strokeWidth={1.2} />
-      ))}
-      {/* lines */}
-      {series.map((s) => (
-        <path
-          key={s.label}
-          d={s.data.map((v, i) => (i === 0 ? "M" : "L") + xs(i) + "," + ys(v)).join(" ")}
-          fill="none"
-          stroke={s.color}
-          strokeWidth={1.8}
-        />
-      ))}
-      {/* volume bars */}
-      {series[0].data.map((_, i) => (
-        <rect
-          key={i}
-          x={xs(i) - 4}
-          y={h - 22}
-          width={8}
-          height={Math.abs((i - 6.5) * 1.4) + 4}
-          fill="var(--rule-2)"
-        />
-      ))}
-      {/* legend */}
-      {series.map((s, i) => (
-        <g key={s.label} transform={`translate(${20 + i * 70}, ${h - 4})`}>
-          <rect width={10} height={2} fill={s.color} y={-3} />
-          <text x={14} y={1} fill="var(--ink-2)" fontSize={10}>
-            {s.label}
-          </text>
-        </g>
-      ))}
-    </svg>
-  );
-}
-
-function DualSpark() {
-  const w = 280;
-  const h = 48;
-  const sentiment = [10, 14, 16, 18, 22, 26, 24, 28, 32, 30];
-  const spread = [22, 18, 14, 12, 10, 8, 10, 6, 4, 6];
-  const xs = (i: number) => (i / 9) * (w - 4) + 2;
-  const ysn = (v: number) => h - ((v - 0) / 36) * (h - 6) - 3;
-  const yss = (v: number) => h - ((v - 0) / 36) * (h - 6) - 3;
-  return (
-    <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" className="h-full w-full">
-      <path
-        d={sentiment.map((v, i) => (i === 0 ? "M" : "L") + xs(i) + "," + ysn(v)).join(" ")}
-        fill="none"
-        stroke="var(--pos)"
-        strokeWidth={1.6}
-      />
-      <path
-        d={spread.map((v, i) => (i === 0 ? "M" : "L") + xs(i) + "," + yss(v)).join(" ")}
-        fill="none"
-        stroke="var(--neg)"
-        strokeWidth={1.6}
-        strokeDasharray="3 2"
-      />
-    </svg>
-  );
-}
-
-// Removed unused icon import-cleanup: Pin, Bell intentionally not rendered yet
-// but reserved as they appear in the mockup's "+ pin / + bell" affordances.
-void Pin;
-void Bell;
